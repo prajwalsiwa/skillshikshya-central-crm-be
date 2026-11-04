@@ -9,6 +9,7 @@ All CRUD endpoints are nested under a specific lead. A flat cross-lead call log 
 | Method | Endpoint | Description | Access |
 |--------|----------|-------------|--------|
 | GET | `/api/calls/` | **All calls across leads** (paginated, newest first) | Authenticated |
+| GET | `/api/calls/export/` | Export all matching calls as a CSV (not paginated) | Authenticated |
 | GET | `/api/leads/{lead_id}/calls/` | List calls for one lead (paginated) | Authenticated |
 | POST | `/api/leads/{lead_id}/calls/` | Add a call (consumes call minutes) | Staff or `lead.add_leadcall` permission |
 | GET | `/api/leads/{lead_id}/calls/{id}/` | Get call detail | Authenticated |
@@ -55,6 +56,19 @@ Read-only list of every call across all leads, **branch-scoped** (staff see all 
 ```
 
 The `lead` field is auto-set from the URL. `created_by` is auto-set to the requesting user.
+
+## Export Calls — `GET /api/calls/export/`
+
+Downloads all calls matching the global call log's search, filters, and branch
+scope, regardless of page size. The response is a streamed UTF-8 CSV with a
+BOM for spreadsheet compatibility. It is named `calls-YYYY-MM-DD.csv` using
+the current Nepal date.
+
+Columns are **Date & time (NPT)**, **Direction**, **Lead**, **Reference**,
+**Phone**, **Caller**, **Logged by**, **Duration (MM:SS)**, **Seconds**,
+**Outcome**, **Notes**, and **Recording**. Text cells beginning with `=`, `+`,
+`-`, or `@` are prefixed with an apostrophe to prevent spreadsheet formula
+execution.
 
 ## Call Activity Summary — `GET /api/calls/summary/`
 

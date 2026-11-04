@@ -185,6 +185,60 @@ class GlobalCallListTests(APITestCase):
         search_lead = self.client.get('/api/calls/?search=Call Person')
         self.assertEqual(search_lead.data['count'], 2)
 
+    def test_export_csv_has_required_columns_npt_and_all_filtered_rows(self):
+        import csv
+        import io
+        from apps.lead.models import LeadCall
+
+        formula_lead = Lead.objects.create(
+            full_name='सीता Export Test', phone='9844444444',
+        )
+        LeadCall.objects.create(
+            lead=formula_lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Counselor Nine',
+            phone_number='9833333333', duration_seconds=259,
+            outcome='interested', notes='=HYPERLINK("https://example.com")',
+            recording_url='https://example.com/recording',
+            created_by=self.counselor, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/export/?direction=outbound&page_size=1')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertRegex(
+            response['Content-Disposition'],
+            r'attachment; filename="calls-\d{4}-\d{2}-\d{2}\.csv"',
+        )
+        self.assertTrue(response.streaming)
+        csv_bytes = b''.join(response.streaming_content)
+        self.assertTrue(csv_bytes.startswith(b'\xef\xbb\xbf'))
+        csv_content = csv_bytes.decode('utf-8-sig')
+        rows = list(csv.reader(io.StringIO(csv_content)))
+        self.assertEqual(rows[0], [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+            'Notes', 'Recording',
+        ])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row[2] for row in rows[1:]}, {
+            self.lead.full_name, formula_lead.full_name,
+        })
+        exported_formula_call = next(
+            row for row in rows[1:] if row[2] == formula_lead.full_name
+        )
+        self.assertEqual(exported_formula_call[0][-6:], '+05:45')
+        self.assertEqual(exported_formula_call[1], 'outbound')
+        self.assertEqual(exported_formula_call[5], 'Counselor Nine')
+        self.assertEqual(exported_formula_call[6], 'Counselor Nine')
+        self.assertEqual(exported_formula_call[7:10], ['04:19', '259', 'interested'])
+        self.assertEqual(
+            exported_formula_call[10], '\'=HYPERLINK("https://example.com")',
+        )
+        self.assertEqual(
+            exported_formula_call[11], 'https://example.com/recording',
+        )
+
     def test_summary_aggregates_totals_and_includes_unknown_creator(self):
         from apps.lead.models import LeadCall
 

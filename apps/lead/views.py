@@ -2,7 +2,7 @@ import csv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from django.http import HttpResponse
+from django.http import StreamingHttpResponse
 from django.utils import timezone
 
 from rest_framework import viewsets, status
@@ -15,6 +15,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Count, Sum, Avg, Q
 from django.db.models.functions import TruncDate
 
+from apps.callminutes.utils import format_duration
 from apps.lead.models import (
     LearningMode, Institution, Province, City, LeadSource, Campaign, LeadStatus, LeadPriority,
     LeadTag, LeadType, Lead, LeadCourseInterest, Enrollment, Payment,
@@ -376,57 +377,57 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='export')
     def export(self, request):
-        queryset = self.filter_queryset(self.get_queryset())
-
-        response = HttpResponse(
-            content_type='text/csv; charset=utf-8',
-        )
-        response['Content-Disposition'] = (
-            'attachment; filename="calls.csv"'
+        queryset = self.filter_queryset(self.get_queryset()).select_related(
+            'lead', 'created_by',
         )
 
-        # UTF-8 BOM helps Excel recognise Unicode correctly.
-        response.write('\ufeff')
+        class Echo:
+            def write(self, value):
+                return value
 
-        writer = csv.writer(response)
+        writer = csv.writer(Echo())
+        headers = [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+            'Notes', 'Recording',
+        ]
 
-        writer.writerow([
-            'Call ID',
-            'Lead Name',
-            'Lead Reference',
-            'Phone Number',
-            'Direction',
-            'Caller',
-            'Call Timestamp',
-            'Duration (Seconds)',
-            'Outcome',
-            'Notes',
-            'Branch',
-            'Created By',
-        ])
-
-        def safe_value(value):
+        def safe_text(value):
             value = '' if value is None else str(value)
             if value.startswith(('=', '+', '-', '@')):
                 return "'" + value
             return value
 
-        for call in queryset.iterator(chunk_size=500):
-            writer.writerow([
-                call.id,
-                safe_value(call.lead.full_name),
-                safe_value(call.lead.reference_number),
-                safe_value(call.phone_number),
-                safe_value(call.direction),
-                safe_value(call.caller),
-                timezone.localtime(call.call_timestamp).isoformat(),
-                call.duration_seconds,
-                safe_value(call.outcome),
-                safe_value(call.notes),
-                safe_value(call.branch.name if call.branch else ''),
-                safe_value(call.created_by.name if call.created_by else ''),
-            ])
+        def csv_rows():
+            yield '\ufeff'
+            yield writer.writerow(headers)
+            for call in queryset.iterator(chunk_size=500):
+                yield writer.writerow([
+                    timezone.localtime(
+                        call.call_timestamp, ZoneInfo('Asia/Kathmandu'),
+                    ).isoformat(),
+                    safe_text(call.direction),
+                    safe_text(call.lead.full_name),
+                    safe_text(call.lead.reference_number),
+                    safe_text(call.phone_number),
+                    safe_text(call.caller),
+                    safe_text(call.created_by.name if call.created_by else 'Unknown'),
+                    format_duration(call.duration_seconds),
+                    call.duration_seconds,
+                    safe_text(call.outcome),
+                    safe_text(call.notes),
+                    safe_text(call.recording_url),
+                ])
 
+        response = StreamingHttpResponse(
+            csv_rows(), content_type='text/csv; charset=utf-8',
+        )
+        export_date = timezone.localtime(
+            timezone.now(), ZoneInfo('Asia/Kathmandu'),
+        ).date()
+        response['Content-Disposition'] = (
+            f'attachment; filename="calls-{export_date.isoformat()}.csv"'
+        )
         return response
 
 
