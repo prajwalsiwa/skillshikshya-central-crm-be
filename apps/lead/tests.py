@@ -155,6 +155,7 @@ class GlobalCallListTests(APITestCase):
         row = response.data['results'][0]
         self.assertEqual(row['lead_name'], 'Call Person')
         self.assertTrue(row['lead_reference_number'].startswith('LD-'))
+        self.assertEqual(row['duration_formatted'], '04:30')
 
     def test_filter_direction(self):
         response = self.client.get('/api/calls/?direction=inbound')
@@ -183,6 +184,132 @@ class GlobalCallListTests(APITestCase):
         self.assertEqual(response.data['count'], 1)
         search_lead = self.client.get('/api/calls/?search=Call Person')
         self.assertEqual(search_lead.data['count'], 2)
+
+    def test_export_csv_has_required_columns_npt_and_all_filtered_rows(self):
+        import csv
+        import io
+        from apps.lead.models import LeadCall
+
+        formula_lead = Lead.objects.create(
+            full_name='सीता Export Test', phone='9844444444',
+        )
+        LeadCall.objects.create(
+            lead=formula_lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Counselor Nine',
+            phone_number='9833333333', duration_seconds=259,
+            outcome='interested', notes='=HYPERLINK("https://example.com")',
+            recording_url='https://example.com/recording',
+            created_by=self.counselor, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/export/?direction=outbound&page_size=1')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertRegex(
+            response['Content-Disposition'],
+            r'attachment; filename="calls-\d{4}-\d{2}-\d{2}\.csv"',
+        )
+        self.assertTrue(response.streaming)
+        csv_bytes = b''.join(response.streaming_content)
+        self.assertTrue(csv_bytes.startswith(b'\xef\xbb\xbf'))
+        csv_content = csv_bytes.decode('utf-8-sig')
+        rows = list(csv.reader(io.StringIO(csv_content)))
+        self.assertEqual(rows[0], [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+            'Notes', 'Recording',
+        ])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row[2] for row in rows[1:]}, {
+            self.lead.full_name, formula_lead.full_name,
+        })
+        exported_formula_call = next(
+            row for row in rows[1:] if row[2] == formula_lead.full_name
+        )
+        self.assertEqual(exported_formula_call[0][-6:], '+05:45')
+        self.assertEqual(exported_formula_call[1], 'outbound')
+        self.assertEqual(exported_formula_call[5], 'Counselor Nine')
+        self.assertEqual(exported_formula_call[6], 'Counselor Nine')
+        self.assertEqual(exported_formula_call[7:10], ['04:19', '259', 'interested'])
+        self.assertEqual(
+            exported_formula_call[10], '\'=HYPERLINK("https://example.com")',
+        )
+        self.assertEqual(
+            exported_formula_call[11], 'https://example.com/recording',
+        )
+
+    def test_summary_aggregates_totals_and_includes_unknown_creator(self):
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Unknown Caller',
+            phone_number='9833333333', duration_seconds=0,
+            created_by=None, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/summary/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 3)
+        self.assertEqual(response.data['inbound'], 1)
+        self.assertEqual(response.data['outbound'], 2)
+        self.assertEqual(response.data['total_seconds'], 330)
+        self.assertEqual(response.data['total_formatted'], '00:05:30')
+        self.assertEqual(response.data['avg_seconds'], 110)
+        self.assertEqual(response.data['connected_calls'], 2)
+        self.assertEqual(response.data['connect_rate'], 0.667)
+        unknown_user = next(
+            user for user in response.data['by_user'] if user['user_id'] is None
+        )
+        self.assertEqual(unknown_user['name'], 'Unknown')
+        self.assertEqual(unknown_user['calls'], 1)
+        self.assertEqual(unknown_user['seconds'], 0)
+
+    def test_summary_uses_nepal_time_and_respects_filters(self):
+        from datetime import datetime, timezone as datetime_timezone
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead,
+            call_timestamp=datetime(2026, 10, 28, 20, tzinfo=datetime_timezone.utc),
+            direction='inbound', caller='Nepal Time Caller',
+            phone_number='9844444444', duration_seconds=90,
+            created_by=self.counselor, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/summary/?direction=inbound')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 2)
+        self.assertEqual(response.data['inbound'], 2)
+        self.assertIn(
+            {'date': '2026-10-29', 'calls': 1, 'seconds': 90},
+            response.data['by_day'],
+        )
+        self.assertEqual(
+            next(
+                row for row in response.data['by_user']
+                if row['user_id'] == self.counselor.id
+            )['calls'],
+            1,
+        )
+
+    def test_summary_returns_zeros_for_no_matching_calls(self):
+        response = self.client.get('/api/calls/summary/?search=no-such-call')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 0)
+        self.assertEqual(response.data['inbound'], 0)
+        self.assertEqual(response.data['outbound'], 0)
+        self.assertEqual(response.data['total_seconds'], 0)
+        self.assertEqual(response.data['total_formatted'], '00:00:00')
+        self.assertEqual(response.data['avg_seconds'], 0)
+        self.assertEqual(response.data['connected_calls'], 0)
+        self.assertEqual(response.data['connect_rate'], 0)
+        self.assertEqual(response.data['by_day'], [])
+        self.assertEqual(response.data['by_user'], [])
 
     def test_branch_scoping_for_non_staff(self):
         from apps.branch.models import Branch
