@@ -155,6 +155,7 @@ class GlobalCallListTests(APITestCase):
         row = response.data['results'][0]
         self.assertEqual(row['lead_name'], 'Call Person')
         self.assertTrue(row['lead_reference_number'].startswith('LD-'))
+        self.assertEqual(row['duration_formatted'], '04:30')
 
     def test_filter_direction(self):
         response = self.client.get('/api/calls/?direction=inbound')

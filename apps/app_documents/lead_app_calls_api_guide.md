@@ -45,6 +45,7 @@ Read-only list of every call across all leads, **branch-scoped** (staff see all 
     "caller": "Shikhar",
     "phone_number": "9877700111",
     "duration_seconds": 270,
+    "duration_formatted": "04:30",
     "outcome": "Interested",
     "notes": "",
     "branch": 1,
