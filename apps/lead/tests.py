@@ -315,11 +315,116 @@ class GlobalCallListTests(APITestCase):
         from apps.branch.models import Branch
         from apps.lead.models import LeadCall
         other_branch = Branch.objects.create(name='Dharan', code='DHR')
-        other_admin = User.objects.create_user(
-            email='br@test.com', name='BR User', password='x',
-            branch=other_branch,
+        other_lead = Lead.objects.create(
+            full_name='Other Branch Lead', phone='9800000999',
         )
-        LeadCall.objects.filter(id=self.recent_call.id).update(branch=None)
-        self.client.force_authenticate(other_admin)
-        response = self.client.get('/api/calls/')
-        self.assertNotIn(self.recent_call.id, [r['id'] for r in response.data['results']])
+        other_call = LeadCall.objects.create(
+            lead=other_lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Other Branch Counselor',
+            phone_number='9800000999', duration_seconds=45,
+            created_by=self.counselor, branch=other_branch,
+        )
+        branch_user = User.objects.create_user(
+            email='branch-user@test.com', name='Branch User', password='x',
+            branch=self.branch,
+        )
+        self.client.force_authenticate(branch_user)
+
+        list_response = self.client.get('/api/calls/')
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        listed_ids = [row['id'] for row in list_response.data['results']]
+        self.assertIn(self.recent_call.id, listed_ids)
+        self.assertIn(self.old_call.id, listed_ids)
+        self.assertNotIn(other_call.id, listed_ids)
+        self.assertNotIn('Other Branch Lead', str(list_response.data))
+
+        summary_response = self.client.get('/api/calls/summary/')
+        self.assertEqual(summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary_response.data['total_calls'], 2)
+
+        export_response = self.client.get('/api/calls/export/')
+        self.assertEqual(export_response.status_code, status.HTTP_200_OK)
+        export_content = b''.join(export_response.streaming_content).decode('utf-8-sig')
+        self.assertIn('Call Person', export_content)
+        self.assertNotIn('Other Branch Lead', export_content)
+
+    def test_staff_branch_filter_applies_to_list_summary_and_export(self):
+        import csv
+        import io
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+
+        other_branch = Branch.objects.create(name='Dharan', code='DHR')
+        other_lead = Lead.objects.create(
+            full_name='Other Branch Lead', phone='9800000888',
+        )
+        LeadCall.objects.create(
+            lead=other_lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Other Branch Counselor',
+            phone_number='9800000888', duration_seconds=45,
+            created_by=self.counselor, branch=other_branch,
+        )
+        self.client.force_authenticate(self.admin)
+
+        all_calls = self.client.get('/api/calls/')
+        self.assertEqual(all_calls.data['count'], 3)
+
+        list_response = self.client.get(f'/api/calls/?branch_id={self.branch.id}')
+        self.assertEqual(list_response.data['count'], 2)
+        self.assertNotIn('Other Branch Lead', str(list_response.data))
+
+        summary_response = self.client.get(
+            f'/api/calls/summary/?branch_id={self.branch.id}',
+        )
+        self.assertEqual(summary_response.data['total_calls'], 2)
+
+        export_response = self.client.get(
+            f'/api/calls/export/?branch_id={self.branch.id}',
+        )
+        export_content = b''.join(export_response.streaming_content).decode('utf-8-sig')
+        rows = list(csv.reader(io.StringIO(export_content)))
+        self.assertEqual(len(rows), 3)
+        self.assertNotIn('Other Branch Lead', export_content)
+
+    def test_list_summary_and_export_use_a_constant_number_of_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.lead.models import LeadCall
+
+        self.client.force_authenticate(self.admin)
+
+        def query_counts():
+            counts = {}
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get('/api/calls/')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            counts['list'] = len(queries)
+
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get('/api/calls/summary/')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            counts['summary'] = len(queries)
+
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get('/api/calls/export/')
+                self.assertTrue(response.streaming)
+                b''.join(response.streaming_content)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            counts['export'] = len(queries)
+            return counts
+
+        counts_for_two_calls = query_counts()
+        for index in range(25):
+            LeadCall.objects.create(
+                lead=self.lead,
+                call_timestamp=self.recent_call.call_timestamp,
+                direction='outbound',
+                caller=f'Counselor {index}',
+                phone_number='9811111111',
+                duration_seconds=index,
+                created_by=self.counselor,
+                branch=self.branch,
+            )
+        counts_for_many_calls = query_counts()
+
+        self.assertEqual(counts_for_two_calls, counts_for_many_calls)
