@@ -1,5 +1,6 @@
 import csv
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from django.http import HttpResponse
 from django.utils import timezone
@@ -11,6 +12,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Count, Sum, Avg, Q
+from django.db.models.functions import TruncDate
 
 from apps.lead.models import (
     LearningMode, Institution, Province, City, LeadSource, Campaign, LeadStatus, LeadPriority,
@@ -298,9 +301,133 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'summary', 'export']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        stats = queryset.aggregate(
+            total_calls=Count('id'),
+            inbound=Count('id', filter=Q(direction='inbound')),
+            outbound=Count('id', filter=Q(direction='outbound')),
+            total_seconds=Sum('duration_seconds'),
+            avg_seconds=Avg('duration_seconds'),
+            connected_calls=Count('id', filter=Q(duration_seconds__gt=0)),
+        )
+        total = stats['total_calls'] or 0
+        connected = stats['connected_calls'] or 0
+        total_seconds = stats['total_seconds'] or 0
+        daily_calls = (
+            queryset
+            .order_by()
+            .annotate(day=TruncDate('call_timestamp', tzinfo=ZoneInfo('Asia/Kathmandu')))
+            .values('day')
+            .annotate(
+                calls=Count('id'),
+                seconds=Sum('duration_seconds'),
+            )
+            .order_by('day')
+        )
+        top_callers = list(
+            queryset
+            .order_by()
+            .values('created_by_id', 'created_by__name')
+            .annotate(
+                calls=Count('id'),
+                seconds=Sum('duration_seconds'),
+            )
+            .order_by('-calls', 'created_by_id')[:10]
+        )
+
+        return Response({
+            'total_calls': total,
+            'inbound': stats['inbound'] or 0,
+            'outbound': stats['outbound'] or 0,
+            'total_seconds': total_seconds,
+            'total_formatted': (
+                f'{total_seconds // 3600:02d}:'
+                f'{(total_seconds % 3600) // 60:02d}:'
+                f'{total_seconds % 60:02d}'
+            ),
+            'avg_seconds': round(stats['avg_seconds'] or 0),
+            'connected_calls': connected,
+            'connect_rate': round(connected / total, 3) if total else 0,
+            'by_day': [
+                {
+                    'date': row['day'].isoformat(),
+                    'calls': row['calls'],
+                    'seconds': row['seconds'] or 0,
+                }
+                for row in daily_calls
+            ],
+            'by_user': [
+                {
+                    'user_id': row['created_by_id'],
+                    'name': row['created_by__name'] or 'Unknown',
+                    'calls': row['calls'],
+                    'seconds': row['seconds'] or 0,
+                }
+                for row in top_callers
+            ],
+        })
+
+    @action(detail=False, methods=['get'], url_path='export')
+    def export(self, request):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        response = HttpResponse(
+            content_type='text/csv; charset=utf-8',
+        )
+        response['Content-Disposition'] = (
+            'attachment; filename="calls.csv"'
+        )
+
+        # UTF-8 BOM helps Excel recognise Unicode correctly.
+        response.write('\ufeff')
+
+        writer = csv.writer(response)
+
+        writer.writerow([
+            'Call ID',
+            'Lead Name',
+            'Lead Reference',
+            'Phone Number',
+            'Direction',
+            'Caller',
+            'Call Timestamp',
+            'Duration (Seconds)',
+            'Outcome',
+            'Notes',
+            'Branch',
+            'Created By',
+        ])
+
+        def safe_value(value):
+            value = '' if value is None else str(value)
+            if value.startswith(('=', '+', '-', '@')):
+                return "'" + value
+            return value
+
+        for call in queryset.iterator(chunk_size=500):
+            writer.writerow([
+                call.id,
+                safe_value(call.lead.full_name),
+                safe_value(call.lead.reference_number),
+                safe_value(call.phone_number),
+                safe_value(call.direction),
+                safe_value(call.caller),
+                timezone.localtime(call.call_timestamp).isoformat(),
+                call.duration_seconds,
+                safe_value(call.outcome),
+                safe_value(call.notes),
+                safe_value(call.branch.name if call.branch else ''),
+                safe_value(call.created_by.name if call.created_by else ''),
+            ])
+
+        return response
 
 
 class NotificationViewSet(viewsets.ModelViewSet):
@@ -598,40 +725,40 @@ class LeadActivityViewSet(viewsets.ModelViewSet):
 class FollowUpViewSet(viewsets.ModelViewSet):
     serializer_class = FollowUpSerializer
     pagination_class = CustomPagination
-    filter_backends = [DjangoFilterBackend, OrderingFilter, BranchFilterBackend]
-    filterset_class = FollowUpFilter
-    ordering_fields = ['scheduled_at']
-    ordering = ['-scheduled_at']
+filter_backends = [DjangoFilterBackend, OrderingFilter, BranchFilterBackend]
+filterset_class = FollowUpFilter
+ordering_fields = ['scheduled_at']
+ordering = ['-scheduled_at']
 
-    def get_queryset(self):
-        return FollowUp.objects.filter(lead_id=self.kwargs['lead_pk']).select_related(
-            'assigned_to', 'created_by', 'updated_by',
-        )
+def get_queryset(self):
+    return FollowUp.objects.filter(lead_id=self.kwargs['lead_pk']).select_related(
+        'assigned_to', 'created_by', 'updated_by',
+    )
 
-    def perform_create(self, serializer):
-        instance = serializer.save(
-            lead_id=self.kwargs['lead_pk'],
-            created_by=self.request.user,
-        )
-        lead = instance.lead
-        if instance.status == 'pending':
-            if lead.next_followup_at is None or instance.scheduled_at < lead.next_followup_at:
-                lead.next_followup_at = instance.scheduled_at
-            else:
-                lead.save(update_fields=['lead_score'])
-                return
-            lead.save(update_fields=['lead_score', 'next_followup_at'])
-
-    def perform_update(self, serializer):
-        instance = serializer.save(updated_by=self.request.user)
-        instance.lead.save(update_fields=['lead_score'])
-
-    def get_permissions(self):
-        if self.action in ['create', 'update', 'partial_update', 'destroy']:
-            permission_classes = [IsAuthenticated, IsStaffOrHasPermission]
+def perform_create(self, serializer):
+    instance = serializer.save(
+        lead_id=self.kwargs['lead_pk'],
+        created_by=self.request.user,
+    )
+    lead = instance.lead
+    if instance.status == 'pending':
+        if lead.next_followup_at is None or instance.scheduled_at < lead.next_followup_at:
+            lead.next_followup_at = instance.scheduled_at
         else:
-            permission_classes = [IsAuthenticated]
-        return [p() for p in permission_classes]
+            lead.save(update_fields=['lead_score'])
+            return
+        lead.save(update_fields=['lead_score', 'next_followup_at'])
+
+def perform_update(self, serializer):
+    instance = serializer.save(updated_by=self.request.user)
+    instance.lead.save(update_fields=['lead_score'])
+
+def get_permissions(self):
+    if self.action in ['create', 'update', 'partial_update', 'destroy']:
+        permission_classes = [IsAuthenticated, IsStaffOrHasPermission]
+    else:
+        permission_classes = [IsAuthenticated]
+    return [p() for p in permission_classes]
 
 
 class LeadDocumentViewSet(viewsets.ModelViewSet):

@@ -184,6 +184,78 @@ class GlobalCallListTests(APITestCase):
         search_lead = self.client.get('/api/calls/?search=Call Person')
         self.assertEqual(search_lead.data['count'], 2)
 
+    def test_summary_aggregates_totals_and_includes_unknown_creator(self):
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=self.recent_call.call_timestamp,
+            direction='outbound', caller='Unknown Caller',
+            phone_number='9833333333', duration_seconds=0,
+            created_by=None, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/summary/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 3)
+        self.assertEqual(response.data['inbound'], 1)
+        self.assertEqual(response.data['outbound'], 2)
+        self.assertEqual(response.data['total_seconds'], 330)
+        self.assertEqual(response.data['total_formatted'], '00:05:30')
+        self.assertEqual(response.data['avg_seconds'], 110)
+        self.assertEqual(response.data['connected_calls'], 2)
+        self.assertEqual(response.data['connect_rate'], 0.667)
+        unknown_user = next(
+            user for user in response.data['by_user'] if user['user_id'] is None
+        )
+        self.assertEqual(unknown_user['name'], 'Unknown')
+        self.assertEqual(unknown_user['calls'], 1)
+        self.assertEqual(unknown_user['seconds'], 0)
+
+    def test_summary_uses_nepal_time_and_respects_filters(self):
+        from datetime import datetime, timezone as datetime_timezone
+        from apps.lead.models import LeadCall
+
+        LeadCall.objects.create(
+            lead=self.lead,
+            call_timestamp=datetime(2026, 10, 28, 20, tzinfo=datetime_timezone.utc),
+            direction='inbound', caller='Nepal Time Caller',
+            phone_number='9844444444', duration_seconds=90,
+            created_by=self.counselor, branch=self.branch,
+        )
+
+        response = self.client.get('/api/calls/summary/?direction=inbound')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 2)
+        self.assertEqual(response.data['inbound'], 2)
+        self.assertIn(
+            {'date': '2026-10-29', 'calls': 1, 'seconds': 90},
+            response.data['by_day'],
+        )
+        self.assertEqual(
+            next(
+                row for row in response.data['by_user']
+                if row['user_id'] == self.counselor.id
+            )['calls'],
+            1,
+        )
+
+    def test_summary_returns_zeros_for_no_matching_calls(self):
+        response = self.client.get('/api/calls/summary/?search=no-such-call')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['total_calls'], 0)
+        self.assertEqual(response.data['inbound'], 0)
+        self.assertEqual(response.data['outbound'], 0)
+        self.assertEqual(response.data['total_seconds'], 0)
+        self.assertEqual(response.data['total_formatted'], '00:00:00')
+        self.assertEqual(response.data['avg_seconds'], 0)
+        self.assertEqual(response.data['connected_calls'], 0)
+        self.assertEqual(response.data['connect_rate'], 0)
+        self.assertEqual(response.data['by_day'], [])
+        self.assertEqual(response.data['by_user'], [])
+
     def test_branch_scoping_for_non_staff(self):
         from apps.branch.models import Branch
         from apps.lead.models import LeadCall
